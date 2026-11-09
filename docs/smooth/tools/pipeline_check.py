@@ -126,6 +126,33 @@ def sf_window(seconds, out):
     out["sf"] = d
 
 
+def cpu_window(seconds, out):
+    """CPU side without any game logging: per-thread load over the window (top -H) and the highest clock each
+    CPU cluster reached. A game or bridge thread near 100 % of a core = CPU-bound on that thread; a cluster that
+    never passes a clock well under its hardware maximum while loaded = a clock cap (heat or power policy)."""
+    span = max(3, seconds - 2)
+    p = subprocess.Popen([ADB, "shell", f"top -H -b -n 2 -d {span} -o TID,%CPU,CMD,NAME"], stdout=subprocess.PIPE,
+                         text=True, encoding="utf-8", errors="replace")
+    pol = sh("ls -d /sys/devices/system/cpu/cpufreq/policy*").split()
+    hw = [int(x) // 1000 for x in sh("cat /sys/devices/system/cpu/cpufreq/policy*/cpuinfo_max_freq").split()]
+    seen = [[] for _ in pol]
+    t0 = time.time()
+    while time.time() - t0 < span:
+        for i, v in enumerate(sh("cat /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq").split()[:len(pol)]):
+            seen[i].append(int(v) // 1000)
+        time.sleep(1)
+    txt = p.communicate(timeout=60)[0]
+    last = txt.split("Threads:")[-1]
+    rows = []
+    for line in last.splitlines():
+        m = re.match(r"\s*(\d+)\s+([0-9.]+) (.{15}) (.*)$", line)
+        if m and float(m.group(2)) > 0 and m.group(4).strip() != "top":
+            rows.append((float(m.group(2)), m.group(3).strip(), m.group(4).strip()[-28:]))
+    rows.sort(reverse=True)
+    out["threads"] = rows[:8]
+    out["clusters"] = [(os.path.basename(pp), max(sv) if sv else None, h) for pp, sv, h in zip(pol, seen, hw)]
+
+
 def main():
     target = float(sys.argv[1])
     seconds = int(sys.argv[2]) if len(sys.argv) > 2 else 10
@@ -137,11 +164,15 @@ def main():
     sfres = {}
     th = threading.Thread(target=sf_window, args=(seconds, sfres))
     th.start()
+    cpures = {}
+    tc = threading.Thread(target=cpu_window, args=(seconds, cpures))
+    tc.start()
     key = os.environ.get("TURN_KEY", "21")
     if key:
         os.environ["TURN_KEY"] = key
     screen_fps.record(seconds, swipe=bool(key))
     th.join()
+    tc.join()
     tmp = os.path.join(os.environ.get("TEMP", "/tmp"), "pipeline_check.mp4")
     subprocess.run([ADB, "pull", screen_fps.REMOTE, tmp], capture_output=True)
     pts, img = screen_fps.frames(tmp)
@@ -180,6 +211,14 @@ def main():
         for thread, (ms, trips, top) in sorted(waits.items(), key=lambda kv: -kv[1][0]):
             print(f"  {thread:24} {ms:6.0f} ms/s in {trips:5.0f} calls/s  e.g. {top}")
 
+    if cpures.get("clusters"):
+        print("CPU clock, highest reached / hardware max (MHz): " +
+              ", ".join(f"{n} {m}/{h}" for n, m, h in cpures["clusters"]))
+    if cpures.get("threads"):
+        print("busiest threads (% of one core):")
+        for pc, tname, proc in cpures["threads"]:
+            print(f"  {pc:5.1f}  {tname:16} {proc}")
+
     # verdict
     v = []
     if before.get("charging") or (before.get("gpu_c") or 0) > 70:
@@ -197,6 +236,14 @@ def main():
             else:
                 v.append(f"BOTTLENECK = game CPU: {gf} fps < {target} while GPU time p90 is only {gp90} ms and the bridge waits are small")
     elif gf is None and comp.get("comp_received_fps") is not None and comp["comp_received_fps"] < target * 0.95:
+        hot = [t for t in cpures.get("threads", []) if t[0] > 85 and t[2] != "top"]
+        capped = [f"{n} {m}/{h}" for n, m, h in cpures.get("clusters", []) if m and h and m < 0.7 * h]
+        if hot:
+            v.append(f"CPU-bound thread: {hot[0][1]} ({hot[0][2]}) at {hot[0][0]:.0f} % of a core" +
+                     (f"; clocks capped: {', '.join(capped)}" if capped else ""))
+        elif cpures.get("threads"):
+            v.append("no CPU thread is saturated: the game waits on the GPU or on a synchronous handoff "
+                     "(lower the graphics to tell the two apart)")
         v.append(f"BOTTLENECK = the game side delivers only {comp['comp_received_fps']} fps (< {target}); add VKBRIDGE_LATLOG=1 "
                  "to the launch options to tell the game, the driver bridge and gamescope apart")
     elif gf is not None and comp.get("comp_received_fps") is not None and comp["comp_received_fps"] < min(gf, target) * 0.95:

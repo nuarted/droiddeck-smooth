@@ -87,8 +87,57 @@ Ruled out by reading the sources:
 
 The same frames that look uneven today would land almost perfectly on the grid. That is the change in [DESIGN.md](DESIGN.md).
 
+## Why the game itself stays near 25-35 fps (2026-11-09)
+
+Measured with [pipeline_check.py](tools/pipeline_check.py) and [wait_trace.py](tools/wait_trace.py), limit off, cool tablet
+(GPU 58-61 °C, not charging), MaliBridge v0.5.4.2.
+
+**Minimal graphics barely helps.**
+
+| Run | Settings | Compositor receives | SurfaceFlinger | Screen |
+|---|---|---|---|---|
+| A1 | as played (quality 2, vsync on) | 22.9 | 27.1 | 26.5 |
+| A2 | as played | 28.5 | 26.0 | 27.4 |
+| B1 | quality 1 + render scale 0.5 (¼ of the pixels) | 34.2 | 32.7 | 32.6 |
+| B2 | the same | 24.9* | 33.1 | 32.3 |
+| C1 | minimal + vsync 0 | 35.6 | 30.1 | 32.9 |
+
+\* the compositor's 10 s stats window did not line up with the run.
+
+A quarter of the pixels gives +15-20 %, and the in-game vsync changes nothing.
+
+**No thread is saturated** (top -H, calibrated: a busy loop reads 99 %):
+- the game's main thread 19-23 % of a core;
+- dxvk-cs 10 %;
+- the busiest bridge server thread 24-30 %.
+
+**The game waits** (atrace scheduler trace, who wakes whom):
+- The main thread runs 23 %, waits for a CPU 6 % and sleeps 71 %:
+  - 48 % waiting for its frame/present thread;
+  - 18 % in synchronous bridge round trips: about 116 per second at 1.56 ms each, ~6 ms per frame.
+- The present thread waits for the bridge (34 %) and for dxvk-queue (31 %), that is, for GPU completion.
+- The bridge thread that waits for the GPU is woken by `mali-event-handler` 50 % of the time, 7 ms each.
+
+So it is a serial chain, CPU → bridge → GPU → back, and every link runs slowly.
+
+**Why every link is slow: MediaTek FPSGO caps the clocks.**
+- **The caps.** The big cores (policy4, 3.3 GHz max) stay at 1.7 GHz even with a busy loop pinned to them. The X925 (3.73 GHz) stays at 1.9 GHz.
+- **Not thermal.** Android reports thermal status 0 with headroom 0.38, and the thermal pressure limits in the trace (2.1/2.5 GHz) sit above the real clocks.
+- **FPSGO's own trace events** (`fstb_systrace`, `fbt_systrace`, `fpsgo_main_systrace`):
+  - It tracks DroidDeck's compositor thread as the "render thread", because that is the only BufferQueue producer it can see.
+  - The game renders out of FPSGO's sight, through the bridge and gamescope.
+  - `max_gpu_cap` = 832 000 kHz, and the GPU sat at 832 MHz the whole time: about half its top clock.
+  - FPSGO sizes CPU and GPU for that light copy thread, which needs very little, so the game gets roughly half of each.
+- **The bridge's session report agrees:** "CPU held at a fixed clock: p4 1700 MHz 67 % of the time".
+
+**Next:**
+- With the device's performance mode or Game Turbo, do the caps move?
+- From the app, an ADPF hint session for the game and bridge threads.
+  - DroidDeck's own `GameThreadHints` is enabled only on the Odin 3, and only for threads busier than 60 %; no thread here is.
+
 ## Open points
 
 - On-device results of the FIFO build: to be added.
 - Burst submission upstream of the compositor: Wine/DXVK/bridge.
-- The memory budget round trips in the bridge.
+- The memory budget round trips in the bridge (seen again: ~6 ms per frame on the main thread).
+- FPSGO clock caps while the game renders out of its sight (above).

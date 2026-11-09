@@ -54,11 +54,18 @@ falls short of the target.
 | FIFO shows every slot, SurfaceFlinger uneven | **compositor → display** (copy misses the latch) | `debug.droiddeck.fifo_lat`, GPU load |
 | presents even, screen uneven | game repeats pictures, or a measurement artifact | check the recording, the threshold (`DIFF_THR`) |
 | every stage keeps up, screen even | none at this target | try a higher target |
+| no thread near 100 %, lower settings barely help, clocks sit far below their maximum | **clock caps** (power governor, e.g. MediaTek FPSGO sizing clocks for the compositor thread, not the game) | performance mode / game mode, ADPF hints for the game threads |
 
 ## Setup for a full run
 
 - In DroidDeck → game → launch options, prepend `VKBRIDGE_LATLOG=1`, then restart the game. Without it, stages 1–4 are
   blank, and the tool says only "the game side delivers too few frames".
+  - MaliBridge v0.5.4.2 (DroidDeck 0.7.0) has no per-frame log. There `pipeline_check.py` falls back to per-thread CPU
+    load and the highest CPU clock each cluster reached.
+- **Who the game waits for:** `adb shell atrace -t 5 -b 98304 sched freq sync mtk_debug -o /data/local/tmp/at.txt`, pull
+  it, then run `python wait_trace.py at.txt Wow-arm64`.
+  - It prints, for each game thread, its share of time running, waiting for a CPU and sleeping, and which thread woke it.
+  - On MediaTek, `mtk_debug` adds FPSGO's view: the tracked render thread, `max_gpu_cap`, target fps.
 - adb over the network: wireless debugging drops when the tablet sleeps. After connecting once, run `adb tcpip 5555`
   and connect to port 5555 (valid until reboot); `svc power stayon true` keeps the screen on.
 - Run, for example:
