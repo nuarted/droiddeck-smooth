@@ -44,9 +44,18 @@ def record(seconds, swipe):
         y = int(sh * 0.35)  # above on-screen controls
         x0, x1 = int(sw * 0.55), int(sw * 0.9)
         dur = int((seconds - 1.5) * 1000)
-        if os.environ.get("TURN_KEY"):
-            # hold a key instead (e.g. TURN_KEY=21 = left arrow, turns the character in many games)
-            adb("shell", f"input keyevent --duration {dur} {os.environ['TURN_KEY']}")
+        if os.environ.get("TURN_STICK"):
+            # TURN_STICK="x y dx": press an on-screen stick at (x, y), push it dx pixels sideways and hold
+            # (DroidDeck's right stick turns the camera in gamepad mode; it can be invisible until touched)
+            x, y, dx = (int(v) for v in os.environ["TURN_STICK"].split())
+            adb("shell", f"input motionevent DOWN {x} {y}; sleep 0.1; input motionevent MOVE {x + dx // 2} {y}; "
+                         f"input motionevent MOVE {x + dx} {y}; sleep {dur / 1000:.1f}; input motionevent UP {x + dx} {y}")
+        elif os.environ.get("TURN_KEY"):
+            # hold a key instead (e.g. TURN_KEY=21 = left arrow, turns the character in many games).
+            # TURN_TAP="x y" taps there first: after switching apps the game window may need a touch to get key focus back.
+            tap = os.environ.get("TURN_TAP", "").strip()
+            pre = f"input tap {tap}; sleep 0.3; " if tap else ""
+            adb("shell", f"{pre}input keyevent --duration {dur} {os.environ['TURN_KEY']}")
         else:
             adb("shell", f"input swipe {x0} {y} {x1} {y} {dur}")
     rec.wait(timeout=seconds + 20)

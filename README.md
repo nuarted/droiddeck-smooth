@@ -93,6 +93,30 @@ v1 alone was not enough. The compositor decided slots on the thread's wake-up ti
 
 Earlier v1 result at frame limit 20, from SurfaceFlinger: 60 % exactly 6 refreshes against 25 % without the queue.
 
+### The game's own frame rate: add the app to Game Turbo (Xiaomi / MediaTek)
+
+On MediaTek chips the vendor governor **FPSGO** sets CPU and GPU clocks for the thread it sees queuing frames to Android.
+Here that thread is DroidDeck's compositor, a light copy. The game renders out of its sight, through the bridge and gamescope.
+So FPSGO sized the clocks for the copy and capped everything at about half:
+- the GPU at 832 MHz;
+- the big CPU cores at 1.7 of 3.3 GHz;
+- the X925 core at 1.9 of 3.73 GHz.
+
+A fresh package such as this one is not in Xiaomi's Game Turbo list. Adding it there (Security → Game Turbo → + →
+DroidDeck Smooth) changed this, on the same tablet and scene:
+
+| | Before (not in Game Turbo) | In Game Turbo |
+|---|---|---|
+| GPU clock cap (FPSGO `max_gpu_cap`) | 832 MHz | **1430 MHz** |
+| big cores / X925 under load | 1.7 / 1.9 GHz | **2.8 / 3.3 GHz** |
+| game, limit off, real frames on screen while turning | 26–27 fps | **36–37 fps** (GPU 75 °C) |
+| limit 30: frames exactly 33.3 ms apart on screen | 85–91 % (cool tablet only) | **88 %, 91 % on a hot tablet** (GPU 73–75 °C) |
+| power draw (DroidDeck HUD) | 5–6 W | 8.5–9.5 W |
+
+Lower graphics barely helped before: a quarter of the pixels gave +15–20 %. The game was waiting in a serial
+CPU → bridge → GPU chain where every link ran at half clock, and no thread was busy.
+Details: [INVESTIGATION.md](docs/smooth/INVESTIGATION.md).
+
 ## Moving over from DroidDeck-MaliBridge
 
 The steps used on the test tablet (adb + `run-as`; both apps are debuggable):
@@ -107,6 +131,8 @@ The steps used on the test tablet (adb + `run-as`; both apps are debuggable):
 5. Make sure the **Mali bridge** is used, not PanVK: prefs `vkBridge=true`, `gpuDriverMode=manual`, `linuxDriver=""`.
    On "auto", 0.7.0 picked PanVK on a Mali-G925: 20 fps instead of 60, plus artifacts.
 6. Sign in to Battle.net again.
+7. **Xiaomi / MediaTek:** add DroidDeck Smooth to Game Turbo (Security → Game Turbo → + → DroidDeck Smooth).
+   - The old package may already be there. The new one is not, and without it the game runs at roughly half the clocks (see above).
 
 ## Using it
 
@@ -167,5 +193,9 @@ one test stub, and `docs/smooth/`.
   - Цена — до двух-трёх кадров дополнительной задержки.
 - **Настройка.** Глубина очереди меняется без перезапуска: `adb shell setprop debug.droiddeck.fifo N` (0 — выключить).
 - **Установка.** Ставится отдельным приложением «DroidDeck Smooth», рядом с обычным DroidDeck.
-- **Статус.** Экспериментальный, работает. На реальном экране при Frame limit 30 **85–91 % кадров идут ровно через 33,3 мс** (без правки 40–50 %). Условие: игра должна рисовать больше 30 кадров, то есть нужен холодный планшет и умеренная графика.
+- **Статус.** Экспериментальный, работает. На реальном экране при Frame limit 30 **85–91 % кадров идут ровно через 33,3 мс** (без правки 40–50 %). Условие: игра должна рисовать больше 30 кадров.
+- **Xiaomi / MediaTek: добавьте DroidDeck Smooth в «Игровой ускоритель»** (Безопасность → Игровой ускоритель → + → DroidDeck Smooth).
+  - Без этого регулятор MediaTek FPSGO держит GPU на 832 МГц и большие ядра на 1,7 ГГц: он «подгоняет» частоты под лёгкий поток композитора, а игру не видит.
+  - С ускорителем: GPU 1430 МГц, ядра 2,8/3,3 ГГц.
+  - Игра выдаёт 36–37 вместо 26–27 кадров, и при лимите 30 на экране 88–91 % кадров стоят ровно, даже на горячем планшете.
 - **Как сделано.** Проект полностью и автоматически сделан ИИ: Claude (Anthropic) в Claude Code. Владелец репозитория только поставил задачу и подтверждал шаги, а замеры на планшете через adb, разбор исходников, модель, код, документацию, форк и сборку ИИ выполнил сам.

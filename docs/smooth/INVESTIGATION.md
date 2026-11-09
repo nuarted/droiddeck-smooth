@@ -130,8 +130,26 @@ So it is a serial chain, CPU → bridge → GPU → back, and every link runs sl
   - FPSGO sizes CPU and GPU for that light copy thread, which needs very little, so the game gets roughly half of each.
 - **The bridge's session report agrees:** "CPU held at a fixed clock: p4 1700 MHz 67 % of the time".
 
+**Fix: Game Turbo.**
+- This tablet's battery settings only offer Balanced and Battery saver.
+- In Xiaomi's Game Turbo the old packages ("DroidDeck", "DroidDeck Mali") were already listed; the new `.smooth` package was not.
+- After adding it (`gb_boosting` 0 → 1), measured with the camera turning on the hidden right stick (`TURN_STICK`):
+
+| | Not in Game Turbo | In Game Turbo |
+|---|---|---|
+| FPSGO `max_gpu_cap` / GPU clock | 832 MHz | 1430 MHz |
+| policy4 / policy7, highest under load | 1700 / 1900 MHz | 2800 / 3300 MHz |
+| limit off: compositor receives | 22.9, 28.5 | 36.0, 38.9 |
+| limit off: real frames on screen | 26.5, 27.4 | 37.0, 35.8 |
+| limit 30: screen frames exactly 33.3 ms apart | 85-91 % (cool tablet) | 88.3 %, 91.4 % (GPU 73-75 °C) |
+| GPU temperature | 58-61 °C | 73-77 °C |
+
+The FIFO stats at limit 30 show a surplus:
+- 370 frames queued against 300 shown, with 69 dropped over depth: the game made ~37 fps.
+- The next run: 303 queued, 6 dropped, 70 ticks waited, the game near 30 in a heavier view.
+
 **Next:**
-- With the device's performance mode or Game Turbo, do the caps move?
+- Long-session heat: whether the clocks stay up after 20-30 minutes.
 - From the app, an ADPF hint session for the game and bridge threads.
   - DroidDeck's own `GameThreadHints` is enabled only on the Odin 3, and only for threads busier than 60 %; no thread here is.
 

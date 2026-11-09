@@ -23,7 +23,10 @@ falls short of the target.
 
 1. **Same scene and the same motion.**
    - Stand on the same spot and close every menu, chat box and popup. A screenshot before each run proves it.
-   - Move the camera with a held key (`TURN_KEY=21` or `22`), not by hand. A still picture cannot show judder.
+   - Move the camera with a held key (`TURN_KEY=21` or `22`) or an on-screen stick (`TURN_STICK="x y dx"`), not by hand.
+     A still picture cannot show judder.
+   - Check the recording really moved. A chat box, the game menu or lost key focus silently stops the turn, and the
+     screen stage then reports "too few changed frames".
 2. **Thermal state is part of the result.**
    - Log GPU and battery temperature before and after every run; the tool does it.
    - Do not compare a cool run with a hot one. Here GPU time was 19 ms cold against 28–31 ms at 79 °C, and charging adds heat.
