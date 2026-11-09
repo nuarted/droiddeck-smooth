@@ -200,6 +200,8 @@ android {
             // droiddeck-smooth: installs next to DroidDeck and DroidDeck-MaliBridge instead of over them
             applicationIdSuffix ".smooth"
             resValue 'string', 'app_name', 'DroidDeck Smooth'
+            // run-as for logs, measurements and moving an existing DroidDeck install over (as DroidDeck-MaliBridge does)
+            debuggable true
         }
     }
 
