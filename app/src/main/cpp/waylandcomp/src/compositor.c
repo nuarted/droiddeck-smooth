@@ -36,6 +36,18 @@
 #include "droiddeck_ext.h"
 #include "droiddeck_color.h"
 #include "compositor_internal.h"
+#include <sys/system_properties.h>
+
+/* droiddeck-smooth: FIFO presentation for the paced game surface.
+ *
+ * With a frame limit the compositor used to show whatever buffer the game committed last when a paced slot
+ * came up. Games behind Wine/DXVK/gamescope commit in bursts (25, 25, 50 ms...), so slots got either a
+ * stale frame (shown twice) or two frames (one dropped) and the screen alternated 25/41 ms. Here every
+ * commit of the game surface waits in a short queue and exactly one is applied per paced slot, oldest
+ * first: the bursts are absorbed by up to `depth` frames of latency and the picture changes on an even
+ * cadence. `setprop debug.droiddeck.fifo N` sets the depth (default 2, 0 turns it off), read live. */
+struct damage_list;
+struct fifo_entry;
 
 #define WLOGI(...) __android_log_print(ANDROID_LOG_INFO, "DroidDeckWayland", __VA_ARGS__)
 #define WLOGE(...) __android_log_print(ANDROID_LOG_ERROR, "DroidDeckWayland", __VA_ARGS__)
@@ -199,6 +211,21 @@ enum surface_role { ROLE_NONE, ROLE_TOPLEVEL, ROLE_SUBSURFACE, ROLE_DESKTOP, ROL
 #define DAMAGE_RECTS 8
 struct damage_list { int32_t r[DAMAGE_RECTS][4]; int n; };
 
+/* One commit's double-buffered state, held back for its paced slot (droiddeck-smooth). */
+struct fifo_entry {
+    struct wl_resource *buffer;
+    struct wl_listener buffer_destroy;
+    int attach, buffer_gone;
+    int src_set, dst_set, opaque_set;
+    float src[4];
+    int dst[2];
+    int opaque[4];
+    struct damage_list damage_buf, damage_local;
+    struct wl_list frames, feedback;
+    int64_t queued_ns;
+};
+#define FIFO_CAP 8
+
 struct surface {
     struct wl_resource *resource;
     struct wl_list link;
@@ -258,6 +285,11 @@ struct surface {
     char *title;
     int announced_vulkan;
     uint32_t hdr_fmt_logged;
+
+    /* droiddeck-smooth: commits of the game surface waiting for their paced slot (oldest first) */
+    struct fifo_entry *fifo[8];
+    int fifo_n;
+    int64_t fifo_seen_ns;
 };
 
 static struct wl_list g_surfaces;
@@ -473,7 +505,10 @@ static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_
     if (buffer_release_blocked(buffer)) return;
     const int limit = g_fps_limit;
     const int64_t interval = limit > 0 ? 1000000000LL / limit : g_refresh_ns;
-    if (g_release_unpaced || interval <= 0 || g_release_timer_fd < 0) { send_buffer_release(buffer); perf_note_release(since_ns); return; }
+    /* droiddeck-smooth: a FIFO-paced surface is held back by its queue; a paced release on top would
+     * starve the client of buffers, so its replaced buffer goes back at once. */
+    const int fifo_paced = s->fifo_seen_ns && now_ns() - s->fifo_seen_ns < 1000000000LL;
+    if (g_release_unpaced || interval <= 0 || g_release_timer_fd < 0 || fifo_paced) { send_buffer_release(buffer); perf_note_release(since_ns); return; }
     int64_t now = now_ns();
     int64_t at = s->next_release_ns + interval;
     int64_t latest = now + interval * (int64_t)(s->releases_pending + 1);
@@ -1202,8 +1237,179 @@ static void surface_drop_idle(struct surface *s) {
     if (buffer) send_buffer_release(buffer);
 }
 
+/* ---- droiddeck-smooth: FIFO of the game surface's commits ---------------------------------------------- */
+
+static atomic_int g_stream_on;          /* defined with the streaming code below */
+static volatile int g_fifo_depth = 2;   /* debug.droiddeck.fifo; 0 = off */
+static struct {
+    unsigned queued, shown, starved, dropped, max_n;
+    int64_t wait_ns, wait_max_ns;
+} g_fifo;
+
+static void fifo_read_depth(void) {
+    static int64_t last;
+    const int64_t now = now_ns();
+    if (last && now - last < 1000000000LL) return;
+    last = now;
+    char v[PROP_VALUE_MAX] = "";
+    int d = 2;
+    if (__system_property_get("debug.droiddeck.fifo", v) > 0) d = atoi(v);
+    if (d < 0) d = 0;
+    if (d > FIFO_CAP - 1) d = FIFO_CAP - 1;
+    if (d != g_fifo_depth)
+        droiddeck_log("pacing", "FIFO presentation: depth %d%s (debug.droiddeck.fifo)", d, d ? "" : ", off");
+    g_fifo_depth = d;
+}
+
+/* Paced FIFO applies while a frame limit is set and nothing needs every commit at once. */
+static int fifo_active(void) {
+    return g_fifo_depth > 0 && g_fps_limit > 0 && !g_release_unpaced && !atomic_load(&g_stream_on) &&
+           !vkp_framegen_active();
+}
+
+static void fifo_on_buffer_destroyed(struct wl_listener *l, void *data) {
+    struct fifo_entry *e = wl_container_of(l, e, buffer_destroy);
+    wl_list_remove(&e->buffer_destroy.link);
+    wl_list_init(&e->buffer_destroy.link);
+    e->buffer = NULL;
+    e->buffer_gone = 1;
+}
+
+/* Move the surface's pending (double-buffered) state into e; the surface's pending state is empty after. */
+static void pending_to_entry(struct surface *s, struct fifo_entry *e) {
+    wl_list_init(&e->frames);
+    wl_list_init(&e->feedback);
+    wl_list_init(&e->buffer_destroy.link);
+    e->attach = s->pending_attach;
+    e->buffer = s->pending_buffer;
+    if (e->buffer) {
+        wl_list_remove(&s->pending_buffer_destroy.link);
+        wl_list_init(&s->pending_buffer_destroy.link);
+        e->buffer_destroy.notify = fifo_on_buffer_destroyed;
+        wl_resource_add_destroy_listener(e->buffer, &e->buffer_destroy);
+    }
+    s->pending_buffer = NULL;
+    s->pending_attach = 0;
+    e->src_set = s->pending_src_set; memcpy(e->src, s->pending_src, sizeof(e->src)); s->pending_src_set = 0;
+    e->dst_set = s->pending_dst_set; memcpy(e->dst, s->pending_dst, sizeof(e->dst)); s->pending_dst_set = 0;
+    e->opaque_set = s->pending_opaque_set; memcpy(e->opaque, s->pending_opaque, sizeof(e->opaque)); s->pending_opaque_set = 0;
+    e->damage_buf = s->pending_damage_buf;
+    e->damage_local = s->pending_damage_local;
+    s->pending_damage_buf.n = s->pending_damage_local.n = 0;
+    wl_list_insert_list(&e->frames, &s->pending_frames);
+    wl_list_init(&s->pending_frames);
+    wl_list_insert_list(&e->feedback, &s->pending_feedback);
+    wl_list_init(&s->pending_feedback);
+}
+
+/* The reverse: e's state becomes the surface's pending state (which must be empty). */
+static void entry_to_pending(struct fifo_entry *e, struct surface *s) {
+    if (e->buffer) {
+        wl_list_remove(&e->buffer_destroy.link);
+        wl_list_init(&e->buffer_destroy.link);
+        s->pending_buffer_destroy.notify = on_pending_buffer_destroyed;
+        wl_resource_add_destroy_listener(e->buffer, &s->pending_buffer_destroy);
+    }
+    s->pending_buffer = e->buffer;
+    /* a buffer the client destroyed while queued: keep the frame's callbacks, skip its attach */
+    s->pending_attach = e->buffer_gone ? 0 : e->attach;
+    e->buffer = NULL;
+    s->pending_src_set = e->src_set; memcpy(s->pending_src, e->src, sizeof(e->src));
+    s->pending_dst_set = e->dst_set; memcpy(s->pending_dst, e->dst, sizeof(e->dst));
+    s->pending_opaque_set = e->opaque_set; memcpy(s->pending_opaque, e->opaque, sizeof(e->opaque));
+    s->pending_damage_buf = e->damage_buf;
+    s->pending_damage_local = e->damage_local;
+    wl_list_insert_list(&s->pending_frames, &e->frames);
+    wl_list_init(&e->frames);
+    wl_list_insert_list(&s->pending_feedback, &e->feedback);
+    wl_list_init(&e->feedback);
+}
+
+/* A queued frame that will never be shown: hand everything back as if it had been replaced. */
+static void fifo_entry_discard(struct fifo_entry *e) {
+    wl_list_remove(&e->buffer_destroy.link);
+    if (e->buffer && !buffer_release_blocked(e->buffer)) send_buffer_release(e->buffer);
+    fire_frames(&e->frames);
+    g_pace.replaced += feedback_discard_all(&e->feedback);
+    free(e);
+}
+
+static void surface_commit_apply(struct surface *s);
+
+static void fifo_capture(struct surface *s) {
+    struct fifo_entry *e = calloc(1, sizeof(*e));
+    if (!e) { surface_commit_apply(s); return; }
+    pending_to_entry(s, e);
+    e->queued_ns = now_ns();
+    s->fifo_seen_ns = e->queued_ns;
+    if (s->fifo_n >= FIFO_CAP) {   /* cannot happen with depth < FIFO_CAP, kept as a guard */
+        fifo_entry_discard(s->fifo[0]);
+        memmove(&s->fifo[0], &s->fifo[1], sizeof(s->fifo[0]) * (size_t)(s->fifo_n - 1));
+        s->fifo_n--;
+        g_fifo.dropped++;
+    }
+    s->fifo[s->fifo_n++] = e;
+    g_fifo.queued++;
+    /* more queued than the depth allows: the oldest waiting frame is dropped, latency stays bounded */
+    while (s->fifo_n > g_fifo_depth && s->fifo_n > 1) {
+        fifo_entry_discard(s->fifo[0]);
+        memmove(&s->fifo[0], &s->fifo[1], sizeof(s->fifo[0]) * (size_t)(s->fifo_n - 1));
+        s->fifo_n--;
+        g_fifo.dropped++;
+    }
+    if ((unsigned)s->fifo_n > g_fifo.max_n) g_fifo.max_n = (unsigned)s->fifo_n;
+}
+
+/* Apply the oldest queued commit now, keeping whatever the client has pending for its next commit. */
+static void fifo_apply_one(struct surface *s) {
+    if (s->fifo_n <= 0) return;
+    struct fifo_entry *e = s->fifo[0];
+    memmove(&s->fifo[0], &s->fifo[1], sizeof(s->fifo[0]) * (size_t)(s->fifo_n - 1));
+    s->fifo_n--;
+    struct fifo_entry stash;
+    memset(&stash, 0, sizeof(stash));
+    pending_to_entry(s, &stash);
+    entry_to_pending(e, s);
+    const int64_t wait = now_ns() - e->queued_ns;
+    g_fifo.wait_ns += wait;
+    if (wait > g_fifo.wait_max_ns) g_fifo.wait_max_ns = wait;
+    g_fifo.shown++;
+    free(e);
+    surface_commit_apply(s);
+    entry_to_pending(&stash, s);
+}
+
+static void fifo_flush(struct surface *s) {
+    while (s->fifo_n > 0) fifo_apply_one(s);
+}
+
+static void fifo_forget_surface(struct surface *s) {
+    for (int i = 0; i < s->fifo_n; i++) {
+        struct fifo_entry *e = s->fifo[i];
+        struct wl_resource *cb, *cbtmp;
+        wl_list_remove(&e->buffer_destroy.link);
+        wl_resource_for_each_safe(cb, cbtmp, &e->frames) wl_resource_destroy(cb);
+        feedback_discard_all(&e->feedback);
+        free(e);
+    }
+    s->fifo_n = 0;
+}
+
 static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     struct surface *s = wl_resource_get_user_data(r);
+    fifo_read_depth();
+    /* Only the game's frames are queued; anything else on that surface while frames wait keeps its order. */
+    const int game_frame = s == g_hud_surface && s->role != ROLE_CURSOR && s->pending_attach && s->pending_buffer &&
+                           get_dmabuf(s->pending_buffer);
+    if (fifo_active() && (game_frame || s->fifo_n > 0)) {
+        fifo_capture(s);   /* the vsync tick applies it on its slot */
+        return;
+    }
+    if (s->fifo_n > 0) fifo_flush(s);
+    surface_commit_apply(s);
+}
+
+static void surface_commit_apply(struct surface *s) {
     struct surface *child;
 
     if (s->xdg_toplevel && !s->toplevel_committed) {
@@ -1353,6 +1559,7 @@ static void surface_resource_destroy(struct wl_resource *r) {
         child->parent = NULL;
     }
     if (s->pending_buffer) wl_list_remove(&s->pending_buffer_destroy.link);
+    fifo_forget_surface(s);
     pending_releases_forget_surface(s);
     drop_dmabuf(s, 0);
     ahb_swapchain_surface_gone(s);
@@ -2459,8 +2666,27 @@ static void on_commit_idle(void *data) {
     render_scene();
 }
 
+/* droiddeck-smooth: on a paced slot exactly one queued game commit is applied (oldest first). Queues of
+ * surfaces that no longer qualify are applied in order at once. */
+static void fifo_tick(int64_t now) {
+    struct surface *s;
+    fifo_read_depth();
+    const int active = fifo_active();
+    const int slot = !scene_held_for_limit(now, g_scene_due_ns, g_fps_limit, g_release_unpaced);
+    int applied = 0;
+    wl_list_for_each(s, &g_surfaces, link) {
+        if (s->fifo_n <= 0) continue;
+        if (!active || s != g_hud_surface) { fifo_flush(s); continue; }
+        if (slot) { fifo_apply_one(s); applied = 1; }
+    }
+    if (active && slot && !applied && g_hud_surface && g_hud_surface->fifo_seen_ns &&
+        now - g_hud_surface->fifo_seen_ns < 200000000LL)
+        g_fifo.starved++;
+}
+
 static void on_vsync(int64_t frame_time_ns) {
     int64_t now = now_ns();
+    fifo_tick(now);
     g_perf.ticks++;
     if (frame_time_ns > 0 && now >= frame_time_ns) {
         const int64_t late = now - frame_time_ns;
@@ -3794,6 +4020,14 @@ static int on_stats_timer(void *data) {
                    g_pace.renders ? (double)g_pace.wait_ns / 1e6 / g_pace.renders : 0.0, (double)g_pace.wait_max_ns / 1e6,
                    g_pace.renders, g_pace.commit_renders, (unsigned long long)game, g_pace.reattaches, g_pace.null_attaches, g_pace.distinct,
                    g_pace.presented, g_pace.replaced, g_pace.undrawn);
+    }
+    if (g_fifo.queued || g_fifo.shown) {
+        droiddeck_log("pacing", "FIFO last 10 s: %u game frames queued, %u shown on their slot, %u dropped (queue over depth %d), "
+                   "%u ticks a slot waited for a late frame | queued %.2f/%.2f ms before shown | deepest queue %u",
+                   g_fifo.queued, g_fifo.shown, g_fifo.dropped, g_fifo_depth, g_fifo.starved,
+                   g_fifo.shown ? (double)g_fifo.wait_ns / 1e6 / g_fifo.shown : 0.0, (double)g_fifo.wait_max_ns / 1e6,
+                   g_fifo.max_n);
+        memset(&g_fifo, 0, sizeof(g_fifo));
     }
     {
         const uint64_t seen = g_game_frames;

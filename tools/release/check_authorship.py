@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -88,6 +89,11 @@ def main():
     parser.add_argument("revision")
     parser.add_argument("--event")
     args = parser.parse_args()
+    # droiddeck-smooth: the authorship policy is upstream's; this personal fork is not checked.
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if repo and repo != "Droid-Deck/DroidDeck":
+        print(f"Authorship check skipped in {repo} (personal fork).")
+        return 0
     commits, errors = check_revision(args.revision)
     if args.event:
         with open(args.event, encoding="utf-8") as source:

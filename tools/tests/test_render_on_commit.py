@@ -51,6 +51,7 @@ static int vkp_cardboard_pose_changed(void) { return pose_changes; }
 static void render_scene(void) { renders++; g_dirty = 0; g_dirty_since_ns = 0; g_rendered_tick_ns = g_tick_vsync_ns; g_tick_held = 0; }
 static int on_fallback_timer(void *data) { return 0; }
 static void on_commit_idle(void *data);
+static void fifo_tick(int64_t now) { (void)now; }  /* droiddeck-smooth: FIFO queue, covered on device */
 '''
 
 CHECKS = r'''

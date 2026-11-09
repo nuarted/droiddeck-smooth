@@ -197,6 +197,9 @@ android {
         release {
             minifyEnabled false
             signingConfig signingConfigs.testkey
+            // droiddeck-smooth: installs next to DroidDeck and DroidDeck-MaliBridge instead of over them
+            applicationIdSuffix ".smooth"
+            resValue 'string', 'app_name', 'DroidDeck Smooth'
         }
     }
 
