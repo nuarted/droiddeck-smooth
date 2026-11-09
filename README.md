@@ -7,8 +7,9 @@
 This fork changes one thing. When a frame limit is set, the game's frames reach the screen at a steady
 33.3 ms (or 16.7 ms…) instead of jumping between 25, 41 and 50 ms.
 
-> **Status: experimental.** It builds in CI and runs on a Mali-G925 tablet. First on-device results: 60 % of intervals exactly on
-> the grid instead of 25 % ([below](#first-results-on-the-device)). It is not perfect yet. Use at your own risk.
+> **Status: experimental, working.** On a Mali-G925 tablet, measured on the real screen at frame limit 30:
+> **85–91 % of frames exactly 33.3 ms apart, against 40–50 % without the change**
+> ([results](#results-on-the-real-screen)). This needs the game to render more than the limit. Use at your own risk.
 > It installs as a separate app (`com.droiddeck.launcher.smooth`, "DroidDeck Smooth"), so an existing
 > DroidDeck or DroidDeck-MaliBridge install stays untouched.
 
@@ -62,23 +63,35 @@ Replaying the recorded frame times through this queue ([`fifo_sim.py`](docs/smoo
 Nothing changes without a frame limit, with frame generation or while streaming.
 Details: [docs/smooth/DESIGN.md](docs/smooth/DESIGN.md).
 
-## First results on the device
+## Results on the real screen
 
-Same scene, toggling only the queue live (`debug.droiddeck.fifo 0` vs `2`), with a frame limit the game can sustain.
-Here that is 20 fps, because the scene ran at ~26–29 fps uncapped on a warm tablet:
+fps counters count frames the game hands over, not what reaches the eye. So the screen is recorded with `screenrecord`
+while the camera turns, and only frames whose picture actually changed are counted
+([`screen_fps.py`](docs/smooth/tools/screen_fps.py)).
 
-| Frame limit 20 (50 ms = 6 refreshes at 120 Hz) | FIFO off | **FIFO on** |
-|---|---|---|
-| intervals exactly 6 refreshes | 25 % | **60 %** |
-| intervals within ±1 refresh | 68 % | **88 %** |
-| within ±4 ms of 50 ms | 29 % | **51 %** |
+Xiaomi Pad Mini, WoW in a forest zone, frame limit 30 on a 120 Hz panel. The game renders 34–38 fps on a cooled tablet.
+Two runs per mode, toggled live in the same scene:
 
-The queue never ran dry in that run ("0 ticks a slot waited"). So the remaining unevenness comes from **after** the
-compositor's decision: its copy of the frame sometimes misses the display's latch. The planned next step is to render one
-refresh early and hand Android the exact present time (`VK_GOOGLE_display_timing`).
+| Mode | Frames exactly 33.3 ms apart (4 refreshes) |
+|---|---|
+| no queue (`debug.droiddeck.fifo 0`), original DroidDeck behaviour | 50 %, 40 % |
+| v1: FIFO only (`fifo_lat 0`) | 80 %, 43 % |
+| **v2: FIFO + exact present time (defaults)** | **85 %, 91 %** |
 
-If the game cannot produce the limit on average, no queue can help. At limit 30 in the same scene (game at ~26 fps) the
-result did not change.
+With v2 almost everything left is ±1 refresh, and long gaps are gone.
+
+v1 alone was not enough. The compositor decided slots on the thread's wake-up time (up to ~9 ms late), and its copy of the frame sometimes missed the display's latch while the GPU was busy with the game. v2 does two things:
+- it decides the slot on the vsync timestamp;
+- it hands each frame to Android with an exact present time, `lat` refreshes after the slot (`VK_GOOGLE_display_timing`).
+
+**Limits:**
+- The game has to render more frames than the limit. When WoW fell to 23–28 fps (hot tablet, heavy view), the queue ran dry and the result fell back to ~45–60 %.
+- When the game can't keep up, a lower even cadence is smoother:
+  - limit 20 (6 refreshes);
+  - 25 on a 50 Hz panel (2 refreshes).
+- Heat matters a lot on this tablet. GPU time per frame was 19 ms cold against 28–31 ms at 79 °C while charging.
+
+Earlier v1 result at frame limit 20, from SurfaceFlinger: 60 % exactly 6 refreshes against 25 % without the queue.
 
 ## Moving over from DroidDeck-MaliBridge
 
@@ -148,8 +161,11 @@ one test stub, and `docs/smooth/`.
 
 - **Проблема.** В WoW на планшете с Mali при Frame limit 30 счётчик показывает 30, но картинка дёргается. Только ~36 % кадров идут ровно через 33,3 мс, остальные скачут: 25/41/50 мс.
 - **Причина.** Игра через Wine/DXVK/мост отдаёт кадры пачками, а композитор DroidDeck показывает «последний пришедший» кадр.
-- **Решение.** Очередь кадров: строго один кадр на каждый такт, по порядку. На записанных кадрах это даёт 0,1–0,2 % повторов. Цена — до двух кадров дополнительной задержки.
+- **Решение.**
+  - v1: очередь кадров, строго один кадр на каждый такт, по порядку.
+  - v2: плюс точное время показа каждого кадра на экране (`VK_GOOGLE_display_timing`).
+  - Цена — до двух-трёх кадров дополнительной задержки.
 - **Настройка.** Глубина очереди меняется без перезапуска: `adb shell setprop debug.droiddeck.fifo N` (0 — выключить).
 - **Установка.** Ставится отдельным приложением «DroidDeck Smooth», рядом с обычным DroidDeck.
-- **Статус.** Экспериментальный. Первые замеры на планшете: 60 % ровных интервалов вместо 25 %; до идеала ещё есть что доделать.
+- **Статус.** Экспериментальный, работает. На реальном экране при Frame limit 30 **85–91 % кадров идут ровно через 33,3 мс** (без правки 40–50 %). Условие: игра должна рисовать больше 30 кадров, то есть нужен холодный планшет и умеренная графика.
 - **Как сделано.** Проект полностью и автоматически сделан ИИ: Claude (Anthropic) в Claude Code. Владелец репозитория только поставил задачу и подтверждал шаги, а замеры на планшете через adb, разбор исходников, модель, код, документацию, форк и сборку ИИ выполнил сам.

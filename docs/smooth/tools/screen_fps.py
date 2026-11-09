@@ -41,10 +41,14 @@ def record(seconds, swipe):
         sw, sh = (int(v) for v in size.split("x"))
         if sw < sh:
             sw, sh = sh, sw
-        y = sh // 2
+        y = int(sh * 0.35)  # above on-screen controls
         x0, x1 = int(sw * 0.55), int(sw * 0.9)
         dur = int((seconds - 1.5) * 1000)
-        adb("shell", f"input swipe {x0} {y} {x1} {y} {dur}")
+        if os.environ.get("TURN_KEY"):
+            # hold a key instead (e.g. TURN_KEY=21 = left arrow, turns the character in many games)
+            adb("shell", f"input keyevent --duration {dur} {os.environ['TURN_KEY']}")
+        else:
+            adb("shell", f"input swipe {x0} {y} {x1} {y} {dur}")
     rec.wait(timeout=seconds + 20)
     time.sleep(1.0)
 
