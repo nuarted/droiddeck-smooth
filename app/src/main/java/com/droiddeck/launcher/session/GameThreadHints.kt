@@ -27,18 +27,35 @@ object GameThreadHints {
 
     private val NOT_GAMES = setOf("steam", "steamwebhelper")
 
+    /** How threads are chosen and kept. */
+    internal class Profile(val enter: Double, val leave: Double, val maxThreads: Int, val leaveWhenPaced: Boolean)
+
+    private val ODIN = Profile(ENTER, LEAVE, MAX_THREADS, leaveWhenPaced = true)
+
+    /** MediaTek: the FPSGO governor sizes CPU and GPU clocks for the one thread it sees queuing frames to Android,
+     *  the compositor's light copy, and caps them at about half while the game renders out of its sight (through the
+     *  bridge and gamescope). The game's threads are mostly waiting in a serial CPU -> bridge -> GPU chain, so none is
+     *  busy (main thread ~20 %): take the busiest few of the game's and the bridge's threads, and keep the hint while
+     *  the game holds its pace - dropping it lets the clocks fall and the pace with them. */
+    private val MEDIATEK = Profile(enter = 0.08, leave = 0.04, maxThreads = 5, leaveWhenPaced = false)
+
     private var worker: Thread? = null
 
     @Synchronized
     fun start(context: Context): String {
         if (!SessionPrefs.gameThreadHints(context)) return "game thread hints: off"
-        if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL != "CQ8725S") return "game thread hints: Odin 3 only"
+        if (Build.VERSION.SDK_INT < 31) return "game thread hints: needs Android 12"
+        val profile = when {
+            Build.SOC_MODEL == "CQ8725S" -> ODIN
+            Build.SOC_MANUFACTURER.equals("Mediatek", ignoreCase = true) -> MEDIATEK
+            else -> return "game thread hints: Odin 3 and MediaTek only"
+        }
         val hm = context.getSystemService(PerformanceHintManager::class.java)
             ?: return "game thread hints: no PerformanceHintManager"
         val pm = context.getSystemService(PowerManager::class.java)
         worker?.interrupt()
-        worker = Thread({ run(hm, pm) }, "game-thread-hints").apply { isDaemon = true; start() }
-        return "game thread hints: watching"
+        worker = Thread({ run(hm, pm, profile) }, "game-thread-hints").apply { isDaemon = true; start() }
+        return "game thread hints: watching" + if (profile === MEDIATEK) " (MediaTek: game and bridge threads, kept while paced)" else ""
     }
 
     @Synchronized
@@ -47,7 +64,7 @@ object GameThreadHints {
         worker = null
     }
 
-    private fun run(hm: PerformanceHintManager, pm: PowerManager) {
+    private fun run(hm: PerformanceHintManager, pm: PowerManager, profile: Profile) {
         val scanner = Scanner()
         var session: PerformanceHintManager.Session? = null
         var boosted = emptySet<Int>()
@@ -65,9 +82,9 @@ object GameThreadHints {
                     pacedFor = if (paced) pacedFor + 1 else 0
                     val spare = pm.isPowerSaveMode || pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL
                     val next = when {
-                        spare || pacedFor >= PACE_LEAVE_S -> emptySet()
-                        paced -> pick(boosted, busy.filterKeys { it in boosted })
-                        else -> pick(boosted, busy)
+                        spare || (profile.leaveWhenPaced && pacedFor >= PACE_LEAVE_S) -> emptySet()
+                        paced -> pick(boosted, busy.filterKeys { it in boosted }, profile)
+                        else -> pick(boosted, busy, profile)
                     }
                     if (next != boosted) {
                         session = update(hm, session, next)
@@ -102,11 +119,11 @@ object GameThreadHints {
     internal fun holdsPace(fps: Double, refreshHz: Double): Boolean =
         fps >= 10 && refreshHz > 0 && (1..4).any { k -> abs(fps - refreshHz / k) < PACE_TOLERANCE * refreshHz / k }
 
-    internal fun pick(boosted: Set<Int>, busy: Map<Int, Double>): Set<Int> =
+    internal fun pick(boosted: Set<Int>, busy: Map<Int, Double>, profile: Profile = ODIN): Set<Int> =
         busy.entries
-            .filter { (tid, share) -> share >= if (tid in boosted) LEAVE else ENTER }
+            .filter { (tid, share) -> share >= if (tid in boosted) profile.leave else profile.enter }
             .sortedWith(compareByDescending<Map.Entry<Int, Double>> { it.key in boosted }.thenByDescending { it.value })
-            .take(MAX_THREADS)
+            .take(profile.maxThreads)
             .map { it.key }
             .toSet()
 
@@ -114,6 +131,7 @@ object GameThreadHints {
 
     private class Scanner {
         private val self = Process.myPid()
+        private val uid = Process.myUid()
         private val hz = Os.sysconf(OsConstants._SC_CLK_TCK).toDouble()
         private var lastNs = 0L
         private var lastProcess = HashMap<Int, Long>()
@@ -131,7 +149,7 @@ object GameThreadHints {
             }
             val top = process.entries
                 .map { (pid, ticks) -> pid to ticks - (lastProcess[pid] ?: ticks) }
-                .filter { (pid, delta) -> delta > 0 && pid != self }
+                .filter { (pid, delta) -> delta > 0 && pid != self && ownedByUs(pid) }
                 .sortedByDescending { it.second }
                 .asSequence()
                 .filter { (pid, _) -> readName("/proc/$pid/comm") !in NOT_GAMES }
@@ -152,6 +170,9 @@ object GameThreadHints {
             lastBusy = busy
             return busy
         }
+
+        /** A hint session only takes this app's threads (the game and the bridge run as its children). */
+        private fun ownedByUs(pid: Int): Boolean = try { Os.stat("/proc/$pid").st_uid == uid } catch (_: Exception) { false }
 
         private fun cpuTicks(path: String): Long? = try {
             val line = File(path).readText()

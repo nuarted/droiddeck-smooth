@@ -18,6 +18,13 @@ class GameThreadHintsTest {
         assertEquals(setOf(1, 5), GameThreadHints.pick(setOf(1), busy))
     }
 
+    @Test fun `MediaTek profile takes up to five waiting threads above 8 percent`() {
+        val mtk = GameThreadHints.Profile(enter = 0.08, leave = 0.04, maxThreads = 5, leaveWhenPaced = false)
+        val busy = mapOf(1 to 0.30, 2 to 0.22, 3 to 0.12, 4 to 0.11, 5 to 0.10, 6 to 0.09, 7 to 0.05)
+        assertEquals(setOf(1, 2, 3, 4, 5), GameThreadHints.pick(emptySet(), busy, mtk))
+        assertEquals(setOf(7, 1, 2, 3, 4), GameThreadHints.pick(setOf(7), busy, mtk))
+    }
+
     @Test fun `a thread gone from proc is dropped`() {
         assertEquals(setOf(2), GameThreadHints.pick(setOf(1, 2), mapOf(2 to 0.7)))
     }

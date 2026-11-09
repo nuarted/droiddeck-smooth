@@ -48,6 +48,8 @@ def record(seconds, swipe):
             # TURN_STICK="x y dx": press an on-screen stick at (x, y), push it dx pixels sideways and hold
             # (DroidDeck's right stick turns the camera in gamepad mode; it can be invisible until touched)
             x, y, dx = (int(v) for v in os.environ["TURN_STICK"].split())
+            # a short nudge first: DroidDeck hides its on-screen controls after a while and the first touch only shows them
+            adb("shell", f"input motionevent DOWN {x} {y}; sleep 0.1; input motionevent UP {x} {y}; sleep 0.4")
             adb("shell", f"input motionevent DOWN {x} {y}; sleep 0.1; input motionevent MOVE {x + dx // 2} {y}; "
                          f"input motionevent MOVE {x + dx} {y}; sleep {dur / 1000:.1f}; input motionevent UP {x + dx} {y}")
         elif os.environ.get("TURN_KEY"):
