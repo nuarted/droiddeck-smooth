@@ -2379,10 +2379,15 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun applyOutputPacing() {
         Log.i(TAG, "perf: " + PerfMode.apply(this, outputFpsLimit(false), mirrorRefreshLimit()))
+        val atSource = noSteamSession() && sourceLimitOn()
+        if (noSteamSession()) setSourceLimit(if (atSource) SessionState.fpsLimit else 0)
         if (CompositorHost.isStarted) {
             val hz = refreshHz()
             val changed = kotlin.math.abs(SessionState.refreshHz - hz) > 0.1f
-            CompositorHost.updatePacing(hz, outputFpsLimit())
+            // With the limit at the source the compositor passes the game's frames through as they come: a second
+            // limiter here would beat against gamescope's and drop or hold frames.
+            CompositorHost.updatePacing(hz, if (atSource) SessionPrefs.compositorFpsLimit(mirrorRefreshLimit(), 0, pipUi)
+                                            else outputFpsLimit())
             pushCardboard(activeCardboard)
             if (changed && ::surfaceView.isInitialized) applyFrameGen()
         }
@@ -2962,6 +2967,53 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (secondScreenMode == SecondScreenMode.NONE) closeSecondScreen(reset = false) else updateKeyboardRoute()
     }
 
+
+    /* Frame limit at the source (DroidDeck Smooth). For non-Steam sessions the drawer's Frame limit used to act only in
+     * DroidDeck's compositor: the game kept rendering 36-40 fps and the compositor showed 30 of them, so every dropped
+     * frame was a jump in the motion even though the frame times on screen were even. gamescope's own limiter - the one
+     * Steam's Frame Limit drives - holds the game itself: its present waits for the paced slot, so the game draws each
+     * frame at an even moment. Measured on WoW at 30: 99.6 % of the frames on screen exactly 33.3 ms apart.
+     * `adb shell setprop debug.droiddeck.source_limit 0` switches back to the compositor limiter (read on each change). */
+    @Volatile private var desiredSourceLimit = 0
+    @Volatile private var appliedSourceLimit: Int? = null
+    @Volatile private var sourceLimitRetries = 0
+
+    private fun sourceLimitOn(): Boolean = runCatching {
+        Class.forName("android.os.SystemProperties").getMethod("get", String::class.java, String::class.java)
+            .invoke(null, "debug.droiddeck.source_limit", "1") as String
+    }.getOrDefault("1") != "0"
+
+    private fun setSourceLimit(fps: Int) {
+        desiredSourceLimit = fps
+        sourceLimitRetries = 0
+        requestSourceLimit()
+    }
+
+    private fun requestSourceLimit() {
+        runCatching { relativeMouseRequests.execute { applySourceLimit() } }
+    }
+
+    private fun applySourceLimit() {
+        val fps = desiredSourceLimit
+        if (appliedSourceLimit == fps) return
+        val request = org.json.JSONObject()
+            .put("kind", "exec")
+            .put("argv", org.json.JSONArray(listOf("gamescopectl", "debug_set_fps_limit", fps.toString())))
+            .put("timeout", 5.0)
+        val result = runCatching { AgentGuest.call(this, request, 8_000, trusted = true) }
+        val answer = result.getOrNull()
+        val applied = answer?.optBoolean("ok") == true
+            && answer.optInt("exitCode", -1) == 0
+            && !answer.optBoolean("timedOut")
+        if (applied) {
+            appliedSourceLimit = fps
+            Log.i(TAG, "frame limit at the source: gamescope limiter " + if (fps > 0) "$fps fps" else "off")
+        } else {
+            Log.w(TAG, "gamescope did not take frame limit $fps: ${result.exceptionOrNull() ?: answer}")
+            if (sourceLimitRetries++ < SOURCE_LIMIT_MAX_RETRIES) uiHandler.postDelayed({ requestSourceLimit() }, 2_000)
+        }
+        if (desiredSourceLimit != fps) requestSourceLimit()
+    }
 
     private val relativeMouseRequests = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "relative-mouse").apply { isDaemon = true }
@@ -5499,6 +5551,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         private const val DESKTOP_GRAB_RETRY_MS = 30_000L
         private const val DESKTOP_GRAB_KEY_HOLD_MS = 40L
         private const val RELATIVE_MOUSE_MAX_RETRIES = 5
+        /** gamescope comes up with the session, well before a launcher-started game: keep trying for a minute. */
+        private const val SOURCE_LIMIT_MAX_RETRIES = 30
         private const val DRAWER_HAT_THRESHOLD = 0.5f
         private const val DRAWER_STICK_ENTER_THRESHOLD = 0.55f
         private const val DRAWER_STICK_EXIT_THRESHOLD = 0.35f
