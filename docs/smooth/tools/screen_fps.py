@@ -68,9 +68,9 @@ def frames(path):
 
 def analyse(pts, img, label):
     diffs = np.abs(np.diff(img, axis=0)).mean(axis=(1, 2))
-    # encoder noise on a still picture stays far below a real camera move; take a threshold between the two
-    thr = max(0.6, float(np.percentile(diffs, 20)) * 3) if len(diffs) else 1.0
+    thr = float(os.environ.get("DIFF_THR", "0.5"))  # mean gray-level change: codec noise on a still picture ~0.03-0.3, a camera move > 1
     changed = [pts[0]] + [pts[i + 1] for i, d in enumerate(diffs) if d > thr]
+    changed = [t for t in changed if t >= pts[0] + 1.2]  # skip the start, before the camera moves
     iv = np.diff(changed) * 1000.0
     if len(iv) < 5:
         print(json.dumps({"label": label, "error": "too few changed frames", "recorded": len(pts)}))
