@@ -31,6 +31,7 @@ struct surface {
     struct wl_listener dmabuf_destroy;
     int releases_pending;
     int64_t next_release_ns;
+    int64_t fifo_seen_ns;   /* droiddeck-smooth: FIFO-paced surfaces release at once */
 };
 /* PRODUCTION_STRUCTS */
 static int g_dev_state, g_fps_limit, g_release_timer_fd;
