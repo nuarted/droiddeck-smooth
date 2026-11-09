@@ -45,6 +45,14 @@ struct vkp_image {
 
 static ANativeWindow *g_window;
 static int g_ahb_import;
+/* droiddeck-smooth: VK_GOOGLE_display_timing (the Android loader implements it on every driver) */
+static int g_display_timing;
+static int64_t g_desired_present_ns;
+static uint32_t g_present_id;
+int vkp_set_desired_present(int64_t ns) {
+    g_desired_present_ns = ns > 0 ? ns : 0;
+    return g_display_timing;
+}
 static char *g_driver_path, *g_library_name, *g_native_lib_dir;
 static int g_dev_state;
 static void device_lost(const char *where);
@@ -578,7 +586,7 @@ static int dev_init(void) {
 
     static const char *const import_exts[4] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf",
                                                "VK_EXT_image_drm_format_modifier", "VK_KHR_image_format_list"};
-    const char *dev_exts[9] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const char *dev_exts[10] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     uint32_t n_dev_exts = 1;
     uint32_t ne = 0;
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
@@ -618,6 +626,9 @@ static int dev_init(void) {
         dev_exts[n_dev_exts++] = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
         dev_exts[n_dev_exts++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
     }
+    g_display_timing = has_ext(exts, ne, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+    if (g_display_timing) dev_exts[n_dev_exts++] = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
+    droiddeck_log("gpu", "present timing (VK_GOOGLE_display_timing): %s", g_display_timing ? "available" : "not offered");
     free(exts);
 
     float prio = 1.0f;
@@ -2220,6 +2231,17 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                                .pWaitSemaphores = &g_rnds[k], .swapchainCount = 1,
                                .pSwapchains = &g_swapchain, .pImageIndices = &img};
+        /* droiddeck-smooth: a paced frame asks for its exact screen time; SurfaceFlinger holds the buffer until
+         * that refresh, so a copy that finishes early or a little late still lands on the same vsync. */
+        VkPresentTimeGOOGLE ptime = {0};
+        VkPresentTimesInfoGOOGLE ptimes = {.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE,
+                                           .swapchainCount = 1, .pTimes = &ptime};
+        if (g_display_timing && g_desired_present_ns > 0 && presents == 1) {
+            ptime.presentID = ++g_present_id;
+            ptime.desiredPresentTime = (uint64_t)g_desired_present_ns;
+            pi.pNext = &ptimes;
+        }
+        if (last) g_desired_present_ns = 0;
         const int64_t t_pres = perf_now();
         pr = g_vk.QueuePresentKHR(g_queue, &pi);
         perf_add(&g_perf.present_ns, &g_perf.present_max_ns, &g_perf.presents, perf_now() - t_pres);

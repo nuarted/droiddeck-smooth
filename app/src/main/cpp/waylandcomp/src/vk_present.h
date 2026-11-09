@@ -11,6 +11,10 @@ void vk_present_set_driver(const char *driver_path, const char *library_name,
 void vk_present_set_window(ANativeWindow *window);
 int vkp_apply_window_request(void);
 
+/* droiddeck-smooth: CLOCK_MONOTONIC ns the next present should reach the screen (VK_GOOGLE_display_timing),
+ * 0 for "as soon as possible". Used once, by the next single present. Returns whether the driver supports it. */
+int vkp_set_desired_present(int64_t ns);
+
 int vkp_quest_layer_presentation(void);
 
 enum vkp_scale_mode { VKP_MODE_OFF = 0, VKP_MODE_FIT = 1, VKP_MODE_STRETCH = 2, VKP_MODE_FILL = 3,

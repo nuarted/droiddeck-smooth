@@ -137,10 +137,15 @@ typedef struct {
 } VkSubmitInfo;
 typedef struct {
     int sType;
+    const void *pNext;
     unsigned waitSemaphoreCount, swapchainCount;
     const int *pWaitSemaphores, *pSwapchains;
     const unsigned *pImageIndices;
 } VkPresentInfoKHR;
+/* droiddeck-smooth: present timing (VK_GOOGLE_display_timing) */
+#define VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE 1000092000
+typedef struct { uint32_t presentID; uint64_t desiredPresentTime; } VkPresentTimeGOOGLE;
+typedef struct { int sType; const void *pNext; unsigned swapchainCount; const VkPresentTimeGOOGLE *pTimes; } VkPresentTimesInfoGOOGLE;
 #define SCENE_FMT 100
 #define HDR_FMT 101
 #define FG_HDR_FMT 102
@@ -179,6 +184,7 @@ static struct {
     int (*QueueSubmit)(int, ...), (*QueuePresentKHR)(int, ...);
 } g_vk = {noop, noop, note_barriers, noop, noop, noop, noop, noop};
 static int g_dev_state = 1, g_window = 1, g_swapchain, g_swap_extra;
+static int g_display_timing; static int64_t g_desired_present_ns; static uint32_t g_present_id;
 static int g_colorspace_ext, g_swap_hdr_unavailable, g_swap_is_hdr, g_swap_hdr_want;
 static int g_plain_frame, g_first_frame_done, g_base_black;
 static int g_qfam, g_queue, g_dev, g_fence, g_swap_fmt = SCENE_FMT;

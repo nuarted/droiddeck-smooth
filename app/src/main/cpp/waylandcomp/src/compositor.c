@@ -1241,8 +1241,9 @@ static void surface_drop_idle(struct surface *s) {
 
 static atomic_int g_stream_on;          /* defined with the streaming code below */
 static volatile int g_fifo_depth = 2;   /* debug.droiddeck.fifo; 0 = off */
+static int g_fifo_lat = 3;              /* debug.droiddeck.fifo_lat: refreshes from the slot's vsync to the screen, 0 = asap */
 static struct {
-    unsigned queued, shown, starved, dropped, max_n;
+    unsigned queued, shown, starved, dropped, max_n, timed;
     int64_t wait_ns, wait_max_ns;
 } g_fifo;
 
@@ -1259,6 +1260,15 @@ static void fifo_read_depth(void) {
     if (d != g_fifo_depth)
         droiddeck_log("pacing", "FIFO presentation: depth %d%s (debug.droiddeck.fifo)", d, d ? "" : ", off");
     g_fifo_depth = d;
+    int lat = 3;
+    v[0] = 0;
+    if (__system_property_get("debug.droiddeck.fifo_lat", v) > 0) lat = atoi(v);
+    if (lat < 0) lat = 0;
+    if (lat > 8) lat = 8;
+    if (lat != g_fifo_lat)
+        droiddeck_log("pacing", "FIFO presentation: frames reach the screen %d refreshes after their slot%s (debug.droiddeck.fifo_lat)",
+                      lat, lat ? "" : " - off, as soon as possible");
+    g_fifo_lat = lat;
 }
 
 /* Paced FIFO applies while a frame limit is set and nothing needs every commit at once. */
@@ -2667,12 +2677,19 @@ static void on_commit_idle(void *data) {
 }
 
 /* droiddeck-smooth: on a paced slot exactly one queued game commit is applied (oldest first). Queues of
- * surfaces that no longer qualify are applied in order at once. */
-static void fifo_tick(int64_t now) {
+ * surfaces that no longer qualify are applied in order at once.
+ *
+ * v2: the slot is decided on the vsync's own timestamp, not on when this thread woke up (that varies by up to
+ * ~9 ms), and the frame is handed to the screen with an exact present time `lat` refreshes after that vsync
+ * (VK_GOOGLE_display_timing). SurfaceFlinger then shows it on that refresh whether the compositor's copy
+ * finished early or a little late, so a busy GPU no longer turns into 41.7/25 ms pairs.
+ * Returns 1 when a queued frame was applied for this tick's render. */
+static int fifo_tick(int64_t now, int64_t frame_time) {
     struct surface *s;
     fifo_read_depth();
     const int active = fifo_active();
-    const int slot = !scene_held_for_limit(now, g_scene_due_ns, g_fps_limit, g_release_unpaced);
+    const int64_t at = frame_time > 0 && now - frame_time < 3 * g_refresh_ns ? frame_time + g_refresh_ns / 2 : now;
+    const int slot = !scene_held_for_limit(at, g_scene_due_ns, g_fps_limit, g_release_unpaced);
     int applied = 0;
     wl_list_for_each(s, &g_surfaces, link) {
         if (s->fifo_n <= 0) continue;
@@ -2682,11 +2699,15 @@ static void fifo_tick(int64_t now) {
     if (active && slot && !applied && g_hud_surface && g_hud_surface->fifo_seen_ns &&
         now - g_hud_surface->fifo_seen_ns < 200000000LL)
         g_fifo.starved++;
+    if (applied && g_fifo_lat > 0 && at != now) {
+        if (vkp_set_desired_present(frame_time + g_fifo_lat * g_refresh_ns - g_refresh_ns / 2)) g_fifo.timed++;
+    }
+    return applied;
 }
 
 static void on_vsync(int64_t frame_time_ns) {
     int64_t now = now_ns();
-    fifo_tick(now);
+    const int fifo_slot = fifo_tick(now, frame_time_ns);
     g_perf.ticks++;
     if (frame_time_ns > 0 && now >= frame_time_ns) {
         const int64_t late = now - frame_time_ns;
@@ -2713,7 +2734,7 @@ static void on_vsync(int64_t frame_time_ns) {
         g_tick_held = 1;
         return;
     }
-    if (g_dirty && scene_held_for_limit(now, g_scene_due_ns, g_fps_limit, g_release_unpaced)) return;
+    if (g_dirty && !fifo_slot && scene_held_for_limit(now, g_scene_due_ns, g_fps_limit, g_release_unpaced)) return;
     if (g_dirty && !scene_waits_for_game(now)) render_scene();
 }
 
@@ -4023,10 +4044,11 @@ static int on_stats_timer(void *data) {
     }
     if (g_fifo.queued || g_fifo.shown) {
         droiddeck_log("pacing", "FIFO last 10 s: %u game frames queued, %u shown on their slot, %u dropped (queue over depth %d), "
-                   "%u ticks a slot waited for a late frame | queued %.2f/%.2f ms before shown | deepest queue %u",
+                   "%u ticks a slot waited for a late frame | queued %.2f/%.2f ms before shown | deepest queue %u | "
+                   "%u given an exact screen time (%d refreshes after the slot)",
                    g_fifo.queued, g_fifo.shown, g_fifo.dropped, g_fifo_depth, g_fifo.starved,
                    g_fifo.shown ? (double)g_fifo.wait_ns / 1e6 / g_fifo.shown : 0.0, (double)g_fifo.wait_max_ns / 1e6,
-                   g_fifo.max_n);
+                   g_fifo.max_n, g_fifo.timed, g_fifo_lat);
         memset(&g_fifo, 0, sizeof(g_fifo));
     }
     {
