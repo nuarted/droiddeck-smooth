@@ -83,7 +83,9 @@ object GameThreadHints {
                     val spare = pm.isPowerSaveMode || pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL
                     val next = when {
                         spare || (profile.leaveWhenPaced && pacedFor >= PACE_LEAVE_S) -> emptySet()
-                        paced -> pick(boosted, busy.filterKeys { it in boosted }, profile)
+                        // Odin 3: once paced, only keep what is boosted. MediaTek: keep choosing among all the game's
+                        // threads, or the ones picked while loading (asset, network) stay and the render chain never joins.
+                        paced && profile.leaveWhenPaced -> pick(boosted, busy.filterKeys { it in boosted }, profile)
                         else -> pick(boosted, busy, profile)
                     }
                     if (next != boosted) {
