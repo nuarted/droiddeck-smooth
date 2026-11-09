@@ -7,8 +7,8 @@
 This fork changes one thing. When a frame limit is set, the game's frames reach the screen at a steady
 33.3 ms (or 16.7 ms…) instead of jumping between 25, 41 and 50 ms.
 
-> **Status: experimental.** The change builds in this repository's CI and has been modelled on frames
-> recorded from a real game. Verification on the device is in progress, and results will be added below. Use at your own risk.
+> **Status: experimental.** It builds in CI and runs on a Mali-G925 tablet. First on-device results: 60 % of intervals exactly on
+> the grid instead of 25 % ([below](#first-results-on-the-device)). It is not perfect yet. Use at your own risk.
 > It installs as a separate app (`com.droiddeck.launcher.smooth`, "DroidDeck Smooth"), so an existing
 > DroidDeck or DroidDeck-MaliBridge install stays untouched.
 
@@ -61,6 +61,39 @@ Replaying the recorded frame times through this queue ([`fifo_sim.py`](docs/smoo
 
 Nothing changes without a frame limit, with frame generation or while streaming.
 Details: [docs/smooth/DESIGN.md](docs/smooth/DESIGN.md).
+
+## First results on the device
+
+Same scene, toggling only the queue live (`debug.droiddeck.fifo 0` vs `2`), with a frame limit the game can sustain.
+Here that is 20 fps, because the scene ran at ~26–29 fps uncapped on a warm tablet:
+
+| Frame limit 20 (50 ms = 6 refreshes at 120 Hz) | FIFO off | **FIFO on** |
+|---|---|---|
+| intervals exactly 6 refreshes | 25 % | **60 %** |
+| intervals within ±1 refresh | 68 % | **88 %** |
+| within ±4 ms of 50 ms | 29 % | **51 %** |
+
+The queue never ran dry in that run ("0 ticks a slot waited"). So the remaining unevenness comes from **after** the
+compositor's decision: its copy of the frame sometimes misses the display's latch. The planned next step is to render one
+refresh early and hand Android the exact present time (`VK_GOOGLE_display_timing`).
+
+If the game cannot produce the limit on average, no queue can help. At limit 30 in the same scene (game at ~26 fps) the
+result did not change.
+
+## Moving over from DroidDeck-MaliBridge
+
+The steps used on the test tablet (adb + `run-as`; both apps are debuggable):
+
+1. Copy the data on the device: `run-as <old> tar -cf - files shared_prefs | run-as <new> tar -xf -`.
+2. Replace the old package name in `shared_prefs/*.xml`, `files/*.json`, `linuxfs/etc/droiddeck/*-socket` and the proot
+   `.l2s` symlinks.
+3. Install this build's add-on packs (`proot`, `directaudio`, `comet` from the CI artifact `droiddeck-packs`) into
+   `files/addons/<name>/<sha256>/`, each with a `.complete` file holding the sha256. Otherwise the app thinks the
+   runtime is missing.
+4. Restore the sticky bit on `linuxfs/tmp/.X11-unix`, `tmp/.ICE-unix` and `tmp/dumps`. Without it Xwayland does not start.
+5. Make sure the **Mali bridge** is used, not PanVK: prefs `vkBridge=true`, `gpuDriverMode=manual`, `linuxDriver=""`.
+   On "auto", 0.7.0 picked PanVK on a Mali-G925: 20 fps instead of 60, plus artifacts.
+6. Sign in to Battle.net again.
 
 ## Using it
 
@@ -118,5 +151,5 @@ one test stub, and `docs/smooth/`.
 - **Решение.** Очередь кадров: строго один кадр на каждый такт, по порядку. На записанных кадрах это даёт 0,1–0,2 % повторов. Цена — до двух кадров дополнительной задержки.
 - **Настройка.** Глубина очереди меняется без перезапуска: `adb shell setprop debug.droiddeck.fifo N` (0 — выключить).
 - **Установка.** Ставится отдельным приложением «DroidDeck Smooth», рядом с обычным DroidDeck.
-- **Статус.** Экспериментальный, проверка на устройстве идёт.
+- **Статус.** Экспериментальный. Первые замеры на планшете: 60 % ровных интервалов вместо 25 %; до идеала ещё есть что доделать.
 - **Как сделано.** Проект полностью и автоматически сделан ИИ: Claude (Anthropic) в Claude Code. Владелец репозитория только поставил задачу и подтверждал шаги, а замеры на планшете через adb, разбор исходников, модель, код, документацию, форк и сборку ИИ выполнил сам.
